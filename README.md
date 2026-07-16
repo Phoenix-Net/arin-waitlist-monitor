@@ -12,7 +12,7 @@ The following command installs system dependencies, creates a Python virtual env
 
 ```bash
 apt update && apt install -y python3 python3-venv python3-pip curl && \
-git clone https://github.com/valornode/arin-waitlist-monitor.git && \
+git clone https://github.com/Phoenix-Net/arin-waitlist-monitor.git && \
 python3 -m venv ~/arin-waitlist && \
 source ~/arin-waitlist-monitor/bin/activate && \
 pip install --upgrade pip playwright && \
