@@ -228,7 +228,8 @@ def scrape_waitlist_rows() -> list[dict]:
     return rows_out
 
 
-def find_entry(rows: list[dict], target_dt_str: str) -> dict | None:    """
+def find_entry(rows: list[dict], target_dt_str: str) -> dict | None:
+    """
     Match by exact timestamp string (normalized whitespace).
     """
     target_norm = " ".join(target_dt_str.split())
@@ -239,7 +240,8 @@ def find_entry(rows: list[dict], target_dt_str: str) -> dict | None:    """
 
 
 def build_body(current_pos: int, total: int, last_pos: int | None, joined: str, maxp: str, minp: str, time_checked: str) -> str:
-    last_pos_str = str(last_pos) if last_pos is not None else "None"    return (
+    last_pos_str = str(last_pos) if last_pos is not None else "None"
+    return (
         "Your current ARIN IPv4 waiting list position is:\n"
         f"{current_pos}/{total}.\n\n"
         "Your last position was:\n"
