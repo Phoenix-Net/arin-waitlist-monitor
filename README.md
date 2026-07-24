@@ -12,12 +12,11 @@ The following command installs system dependencies, creates a Python virtual env
 
 ```bash
 apt update && apt install -y python3 python3-venv python3-pip curl && \
-python3 -m venv /opt/arin-waitlist && \
-source /opt/arin-waitlist/bin/activate && \
+git clone https://github.com/Phoenix-Net/arin-waitlist-monitor.git && \
+python3 -m venv ~/arin-waitlist && \
+source ~/arin-waitlist-monitor/bin/activate && \
 pip install --upgrade pip playwright && \
-python -m playwright install --with-deps chromium && \
-curl -o /opt/arin_waitlist.py https://raw.githubusercontent.com/valornode/arin-waitlist-monitor/refs/heads/main/arin_waitlist.py && \
-curl -o /opt/arin_waitlist.env https://raw.githubusercontent.com/valornode/arin-waitlist-monitor/refs/heads/main/arin_waitlist.env
+python -m playwright install --with-deps chromium
 ```
 
 ---
@@ -27,7 +26,7 @@ curl -o /opt/arin_waitlist.env https://raw.githubusercontent.com/valornode/arin-
 Open the file for editing:
 
 ```bash
-nano /opt/arin_waitlist.env
+nano ~/arin-waitlist-monitor/arin_waitlist.env
 ```
 Update the following fields:
 
@@ -60,26 +59,26 @@ Update the following fields:
 
 Run this to test the script and make sure your .env is setup properly.
 ```
-set -a && source /opt/arin_waitlist.env && set +a
-source /opt/arin-waitlist/bin/activate
-python /opt/arin_waitlist.py --once
+set -a && source ~/arin-waitlist-monitor/arin_waitlist.env && set +a
+source ~/arin-waitlist-monitor/bin/activate
+python ~/arin-waitlist-monitor/arin_waitlist.py --once
 ```
 
 ---
 
 ## Run the Script Automatically
 
-Edit the crontab and add whichever you prefer:
+Edit the crontab and add whichever you prefer, changing the location of the script files as needed.
 ```
 crontab -e
 ```
 This will make the script run every 12 hours:
 ```
-0 */12 * * * set -a && source /opt/arin_waitlist.env && set +a && source /opt/arin-waitlist/bin/activate && python /opt/arin_waitlist.py --once >> /var/log/arin_waitlist.log 2>&1
+0 */12 * * * set -a && source /home/[user]/arin-waitlist-monitor/arin_waitlist.env && set +a && source /home/[user]/arin-waitlist-monitor/bin/activate && python /home/[user]/arin-waitlist-monitor/arin_waitlist.py --once >> /home/[user]/arin-waitlist-monitor/arin_waitlist.log 2>&1
 ```
 This will make the script run every day at midnight:
 ```
-0 0 * * * set -a && source /opt/arin_waitlist.env && set +a && source /opt/arin-waitlist/bin/activate && python /opt/arin_waitlist.py --once >> /var/log/arin_waitlist.log 2>&1
+0 0 * * * set -a && source /home/[user]/arin-waitlist-monitor/arin_waitlist.env && set +a && source /home/[user]/arin-waitlist-monitor/bin/activate && python /home/[user]/arin-waitlist-monitor/arin_waitlist.py --once >> /home/[user]/arin-waitlist-monitor/log/arin_waitlist.log 2>&1
 ```
 
 ---
