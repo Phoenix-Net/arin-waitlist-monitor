@@ -1,0 +1,9 @@
+services:
+  arin-waitlist:
+    build: .
+    volumes:
+      - ./arin_waitlist.env:/app/arin_waitlist.env:ro
+      - ./data:/data
+    shm_size: 256mb
+    init: true
+    restart: unless-stopped

@@ -4,9 +4,9 @@ ARIN IPv4 Waiting List Monitor (Playwright)
 
 - Scrapes ARIN waiting list table (JS-rendered) via Playwright
 - Finds your entry by the exact timestamp string
-- Posts your current position to a Fluxer channel each run
+- Posts your current position to Fluxer via an incoming webhook each run
 - Optionally emails the same update (STARTTLS or SMTPS)
-- Self-hosted Fluxer instances supported via FLUXER_API_URL
+- Self-hosted Fluxer instances work by pasting that instance's webhook URL
 - Loads configuration from .env / arin_waitlist.env automatically
 
 Exit codes:
@@ -19,14 +19,15 @@ import os
 import re
 import json
 import time
-import asyncio
 import argparse
 import smtplib
 import ssl
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
@@ -35,14 +36,8 @@ try:
 except Exception:
     ZoneInfo = None  # type: ignore
 
-try:
-    import fluxerpy3
-except ImportError:
-    fluxerpy3 = None  # type: ignore
-
 
 WAITLIST_URL = "https://www.arin.net/resources/guide/ipv4/waiting_list/"
-OFFICIAL_FLUXER_API_URL = "https://api.fluxer.app/v1"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -129,10 +124,10 @@ DEFAULT_TARGET_DATE = os.getenv("ARIN_TARGET_DATE", "Tue, 03 Feb 2026, 12:17:25 
 DEFAULT_INTERVAL_SECONDS = int(os.getenv("ARIN_CHECK_INTERVAL_SECONDS", str(24 * 60 * 60)))
 DEFAULT_STATE_FILE = os.getenv("ARIN_STATE_FILE", "arin_waitlist_state.json")
 
-# Fluxer settings (env)
-FLUXER_TOKEN = os.getenv("FLUXER_TOKEN", "")
-FLUXER_CHANNEL_ID = os.getenv("FLUXER_CHANNEL_ID", "")
-FLUXER_API_URL_RAW = os.getenv("FLUXER_API_URL", OFFICIAL_FLUXER_API_URL)
+# Fluxer webhook (env) — paste the full incoming webhook URL from channel settings
+FLUXER_WEBHOOK_URL = os.getenv("FLUXER_WEBHOOK_URL", "").strip()
+FLUXER_WEBHOOK_USERNAME = os.getenv("FLUXER_WEBHOOK_USERNAME", "").strip()
+FLUXER_WEBHOOK_TIMEOUT = int(os.getenv("FLUXER_WEBHOOK_TIMEOUT", "15"))
 
 # SMTP settings (env) — optional alongside Fluxer
 SMTP_HOST = os.getenv("SMTP_HOST", "")
@@ -214,33 +209,29 @@ def format_time_checked_cst(now_utc: datetime) -> str:
     return local.strftime("%m/%d/%Y %I:%M%p") + " CST"
 
 
-def normalize_fluxer_api_url(url: str) -> str:
-    """
-    Accept either a full API base (…/v1 or …/api/v1) or a host-only URL.
+def redact_webhook_url(url: str) -> str:
+    """Hide the webhook token in logs: .../webhooks/{id}/{token} -> .../{id}/***"""
+    parsed = urlparse(url)
+    parts = parsed.path.split("/")
+    try:
+        i = parts.index("webhooks")
+    except ValueError:
+        return f"{parsed.scheme}://{parsed.netloc}/***"
+    if i + 2 < len(parts) and parts[i + 2]:
+        parts[i + 2] = "***"
+    return urlunparse(parsed._replace(path="/".join(parts)))
 
-    Examples:
-      https://api.fluxer.app/v1          -> unchanged
-      https://fluxer.example.com         -> https://fluxer.example.com/v1
-      https://fluxer.example.com/v1/     -> https://fluxer.example.com/v1
-    """
-    raw = (url or "").strip()
-    if not raw:
-        return OFFICIAL_FLUXER_API_URL
 
-    parsed = urlparse(raw)
-    if not parsed.scheme or not parsed.netloc:
-        warn(f"FLUXER_API_URL looks invalid ({raw!r}); using official API")
-        return OFFICIAL_FLUXER_API_URL
-
-    path = parsed.path.rstrip("/")
-    if not path:
-        path = "/v1"
-
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+def webhook_execute_url(url: str) -> str:
+    """Ask Fluxer to wait for the message so we can see HTTP errors."""
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.setdefault("wait", "true")
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def fluxer_configured() -> bool:
-    return bool(FLUXER_TOKEN and FLUXER_CHANNEL_ID)
+    return bool(FLUXER_WEBHOOK_URL)
 
 
 def email_configured(recipients: list[str] | None = None) -> bool:
@@ -296,36 +287,50 @@ def send_email(subject: str, body: str) -> bool:
         return False
 
 
-async def _send_fluxer_async(content: str) -> None:
-    api_url = normalize_fluxer_api_url(FLUXER_API_URL_RAW)
-    log(f"Fluxer API: {api_url} channel={FLUXER_CHANNEL_ID}")
-    async with fluxerpy3.Client(token=FLUXER_TOKEN, base_url=api_url) as client:
-        me = await client.get_me()
-        log(f"Logged in to Fluxer as {me.username}")
-        await client.send_message(FLUXER_CHANNEL_ID, content)
-
-
 def send_fluxer(subject: str, body: str) -> bool:
     """
-    Post the waitlist update to a Fluxer channel via fluxerpy3.
-    Works with the official API or a self-hosted instance (FLUXER_API_URL).
+    POST the waitlist update to a Fluxer incoming webhook.
+    Official or self-hosted — the webhook URL already includes the host.
     """
     if not fluxer_configured():
-        warn("Fluxer not fully configured (need FLUXER_TOKEN and FLUXER_CHANNEL_ID); skipping.")
+        warn("Fluxer not configured (need FLUXER_WEBHOOK_URL); skipping.")
         return False
 
-    if fluxerpy3 is None:
-        err("fluxerpy3 is not installed. Run: pip install fluxerpy3")
+    parsed = urlparse(FLUXER_WEBHOOK_URL)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        err(f"FLUXER_WEBHOOK_URL is not a valid http(s) URL: {FLUXER_WEBHOOK_URL!r}")
         return False
 
-    content = f"**{subject}**\n\n{body}".strip()
+    payload: dict = {"content": f"**{subject}**\n\n{body}".strip()}
+    if FLUXER_WEBHOOK_USERNAME:
+        payload["username"] = FLUXER_WEBHOOK_USERNAME
 
+    url = webhook_execute_url(FLUXER_WEBHOOK_URL)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "arin-waitlist-monitor",
+        },
+    )
+
+    log(f"Posting to Fluxer webhook {redact_webhook_url(FLUXER_WEBHOOK_URL)}")
     try:
-        asyncio.run(_send_fluxer_async(content))
-        log("Fluxer message sent successfully.")
+        with urllib.request.urlopen(req, timeout=FLUXER_WEBHOOK_TIMEOUT) as resp:
+            if resp.status not in (200, 204):
+                err(f"Fluxer webhook returned HTTP {resp.status}")
+                return False
+        log("Fluxer webhook posted successfully.")
         return True
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        err(f"Fluxer webhook failed (HTTP {e.code}): {detail or e.reason}")
+        return False
     except Exception as e:
-        err(f"Fluxer send failed: {e}")
+        err(f"Fluxer webhook failed: {e}")
         return False
 
 
@@ -339,7 +344,7 @@ def notify(subject: str, body: str) -> None:
     if fluxer_configured():
         sent = send_fluxer(subject, body) or sent
     else:
-        log("Fluxer notifications disabled (set FLUXER_TOKEN and FLUXER_CHANNEL_ID to enable).")
+        log("Fluxer notifications disabled (set FLUXER_WEBHOOK_URL to enable).")
 
     if email_configured():
         sent = send_email(subject, body) or sent
@@ -359,7 +364,12 @@ def scrape_waitlist_rows() -> list[dict]:
 
     log("Launching Chromium (headless)")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Chromium's sandbox and tiny /dev/shm often fail inside Docker.
+        in_docker = Path("/.dockerenv").exists()
+        launch_args = ["--disable-dev-shm-usage"]
+        if in_docker or os.getenv("PLAYWRIGHT_NO_SANDBOX"):
+            launch_args.append("--no-sandbox")
+        browser = p.chromium.launch(headless=True, args=launch_args)
         page = browser.new_page()
 
         log("Loading ARIN waiting list page")

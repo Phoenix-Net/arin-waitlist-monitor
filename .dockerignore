@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.env
+arin_waitlist.env
+data
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

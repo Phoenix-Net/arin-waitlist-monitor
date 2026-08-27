@@ -1,8 +1,8 @@
 # ARIN IPv4 Waiting List Monitor
 
-When the script runs, it launches a headless Chromium browser, loads the ARIN IPv4 Waiting List page, extracts the rendered table, locates your entry by matching the exact “Date and Time Added to Waiting List”, and posts your current position to a [Fluxer](https://github.com/beennnii/fluxerpy3) channel. The previous position is stored locally so progress can be tracked over time.
+When the script runs, it launches a headless Chromium browser, loads the ARIN IPv4 Waiting List page, extracts the rendered table, locates your entry by matching the exact “Date and Time Added to Waiting List”, and posts your current position to a Fluxer channel via an [incoming webhook](https://docs.fluxer.app/api-reference/webhooks/execute-webhook). The previous position is stored locally so progress can be tracked over time.
 
-Official Fluxer (`https://api.fluxer.app/v1`) and self-hosted instances are both supported via `FLUXER_API_URL`. Email notifications remain optional if SMTP is configured.
+Official Fluxer and self-hosted instances both work — paste the webhook URL your instance gives you. Email notifications remain optional if SMTP is configured.
 
 ---
 
@@ -23,7 +23,13 @@ python -m playwright install --with-deps chromium
 
 ## Edit the Environment Variables
 
-The script automatically loads `.env` or `arin_waitlist.env` from the same directory as `arin_waitlist.py` (no `source` required). Copy the example and edit:
+The script automatically loads `.env` or `arin_waitlist.env` from the same directory as `arin_waitlist.py` (no `source` required). Docker Compose mounts `arin_waitlist.env` into the container, so edit that file in place:
+
+```bash
+nano ~/arin-waitlist-monitor/arin_waitlist.env
+```
+
+For a native (non-Docker) install you can also copy it to `.env`:
 
 ```bash
 cp ~/arin-waitlist-monitor/arin_waitlist.env ~/arin-waitlist-monitor/.env
@@ -37,18 +43,15 @@ Update the following fields:
     This must exactly match the “Date and Time Added to Waiting List” shown on the ARIN IPv4 Waiting List page.
     The match is case-sensitive and includes the day name and timezone.
 
-- **FLUXER_TOKEN**
+- **FLUXER_WEBHOOK_URL**
 
-    Bot token for your Fluxer bot (not a user token).
+    Full incoming webhook URL from the Fluxer channel (Integrations → Webhooks).
+    Official URLs look like `https://api.fluxer.app/v1/webhooks/{id}/{token}`.
+    For a self-hosted server, paste the URL that instance shows you.
 
-- **FLUXER_CHANNEL_ID**
+- **FLUXER_WEBHOOK_USERNAME** *(optional)*
 
-    Channel ID where the daily position update should be posted.
-
-- **FLUXER_API_URL**
-
-    API base URL. Defaults to the official instance, `https://api.fluxer.app/v1`.
-    For a self-hosted server you can set either the host (`https://fluxer.example.com`) or the full API path (`https://fluxer.example.com/v1`).
+    Display name used for webhook posts. Leave unset to keep the webhook’s own name.
 
 Email is optional. Leave the SMTP fields blank to skip it, or fill them in to also send the update by email:
 
@@ -56,6 +59,34 @@ Email is optional. Leave the SMTP fields blank to skip it, or fill them in to al
 - **SMTP_PORT** — `465` for SMTPS or `587` for STARTTLS
 - **SMTP_USER** / **SMTP_PASS** — SMTP credentials
 - **MAIL_FROM** / **MAIL_TO** — sender and recipients (comma/semicolon/space separated)
+
+---
+
+## Run with Docker
+
+Build the image locally and start the monitor. Watch mode is the default (one check per day).
+
+```bash
+docker compose up --build -d
+```
+
+A one-shot check (useful for testing your env file):
+
+```bash
+docker compose run --rm arin-waitlist --once
+```
+
+Rebuild after pulling updates:
+
+```bash
+docker compose up --build -d
+```
+
+Waitlist position is stored in `./data/` on the host so it survives container rebuilds. Logs:
+
+```bash
+docker compose logs -f
+```
 
 ---
 

@@ -1,3 +1,2 @@
 playwright
-fluxerpy3
 python-dotenv
