@@ -4,12 +4,10 @@ ARIN IPv4 Waiting List Monitor (Playwright)
 
 - Scrapes ARIN waiting list table (JS-rendered) via Playwright
 - Finds your entry by the exact timestamp string
-- ALWAYS emails your current position each run (or prints if email fails)
-- Supports:
-    - STARTTLS SMTP (typically port 587)
-    - SMTPS implicit TLS (typically port 465)
-- Verbose progress output
-- Multiple recipients supported via MAIL_TO
+- Posts your current position to a Fluxer channel each run
+- Optionally emails the same update (STARTTLS or SMTPS)
+- Self-hosted Fluxer instances supported via FLUXER_API_URL
+- Loads configuration from .env / arin_waitlist.env automatically
 
 Exit codes:
   0 = found
@@ -21,11 +19,14 @@ import os
 import re
 import json
 import time
+import asyncio
 import argparse
 import smtplib
 import ssl
 from email.message import EmailMessage
 from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
@@ -34,14 +35,106 @@ try:
 except Exception:
     ZoneInfo = None  # type: ignore
 
+try:
+    import fluxerpy3
+except ImportError:
+    fluxerpy3 = None  # type: ignore
+
 
 WAITLIST_URL = "https://www.arin.net/resources/guide/ipv4/waiting_list/"
+OFFICIAL_FLUXER_API_URL = "https://api.fluxer.app/v1"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def log(msg: str) -> None:
+    print(f"[INFO] {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"[WARN] {msg}", flush=True)
+
+
+def err(msg: str) -> None:
+    print(f"[ERROR] {msg}", flush=True)
+
+
+def _strip_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _parse_env_file(path: Path) -> None:
+    """
+    Minimal KEY=VALUE loader. Existing environment variables win.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            os.environ[key] = _strip_env_value(value)
+
+
+def load_env_file() -> None:
+    """
+    Load the first env file found, without overriding already-set variables.
+    Preference: python-dotenv if installed, otherwise a small built-in parser.
+    """
+    candidates = [
+        SCRIPT_DIR / ".env",
+        SCRIPT_DIR / "arin_waitlist.env",
+        Path.cwd() / ".env",
+        Path.cwd() / "arin_waitlist.env",
+    ]
+
+    chosen: Path | None = None
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if path.is_file():
+            chosen = path
+            break
+
+    if chosen is None:
+        return
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        _parse_env_file(chosen)
+    else:
+        load_dotenv(chosen, override=False)
+
+    log(f"Loaded env from {chosen}")
+
+
+load_env_file()
+
 
 DEFAULT_TARGET_DATE = os.getenv("ARIN_TARGET_DATE", "Tue, 03 Feb 2026, 12:17:25 EST")
-DEFAULT_INTERVAL_SECONDS = int(os.getenv("ARIN_CHECK_INTERVAL_SECONDS", str(12 * 60 * 60)))
+DEFAULT_INTERVAL_SECONDS = int(os.getenv("ARIN_CHECK_INTERVAL_SECONDS", str(24 * 60 * 60)))
 DEFAULT_STATE_FILE = os.getenv("ARIN_STATE_FILE", "arin_waitlist_state.json")
 
-# SMTP settings (env)
+# Fluxer settings (env)
+FLUXER_TOKEN = os.getenv("FLUXER_TOKEN", "")
+FLUXER_CHANNEL_ID = os.getenv("FLUXER_CHANNEL_ID", "")
+FLUXER_API_URL_RAW = os.getenv("FLUXER_API_URL", OFFICIAL_FLUXER_API_URL)
+
+# SMTP settings (env) — optional alongside Fluxer
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -66,18 +159,6 @@ if ZoneInfo is not None:
 ROW_RE = re.compile(
     r"^\s*(?P<pos>\d+)\s+(?P<dt>(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),.+?)\s+(?P<max>/\d+)\s+(?P<min>/\d+)\s*$"
 )
-
-
-def log(msg: str) -> None:
-    print(f"[INFO] {msg}", flush=True)
-
-
-def warn(msg: str) -> None:
-    print(f"[WARN] {msg}", flush=True)
-
-
-def err(msg: str) -> None:
-    print(f"[ERROR] {msg}", flush=True)
 
 
 def parse_recipients(mail_to_raw: str) -> list[str]:
@@ -133,23 +214,56 @@ def format_time_checked_cst(now_utc: datetime) -> str:
     return local.strftime("%m/%d/%Y %I:%M%p") + " CST"
 
 
-def send_email(subject: str, body: str) -> None:
+def normalize_fluxer_api_url(url: str) -> str:
+    """
+    Accept either a full API base (…/v1 or …/api/v1) or a host-only URL.
+
+    Examples:
+      https://api.fluxer.app/v1          -> unchanged
+      https://fluxer.example.com         -> https://fluxer.example.com/v1
+      https://fluxer.example.com/v1/     -> https://fluxer.example.com/v1
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return OFFICIAL_FLUXER_API_URL
+
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        warn(f"FLUXER_API_URL looks invalid ({raw!r}); using official API")
+        return OFFICIAL_FLUXER_API_URL
+
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/v1"
+
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def fluxer_configured() -> bool:
+    return bool(FLUXER_TOKEN and FLUXER_CHANNEL_ID)
+
+
+def email_configured(recipients: list[str] | None = None) -> bool:
+    if recipients is None:
+        recipients = parse_recipients(MAIL_TO_RAW)
+    return bool(SMTP_HOST and SMTP_USER and SMTP_PASS and recipients and MAIL_FROM)
+
+
+def send_email(subject: str, body: str) -> bool:
     """
     Supports both STARTTLS SMTP and SMTPS:
       - If SMTP_PORT == 465: SMTPS (implicit TLS) via SMTP_SSL
       - Else: SMTP + STARTTLS
     Multiple recipients supported via MAIL_TO (comma/semicolon/space separated).
-    If sending fails, prints message instead (non-fatal).
+    Returns True if the message was sent.
     """
     recipients = parse_recipients(MAIL_TO_RAW)
 
     log(f"Email config: host={SMTP_HOST!r} port={SMTP_PORT} user={SMTP_USER!r} from={MAIL_FROM!r} to={recipients!r}")
 
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and recipients and MAIL_FROM):
-        warn("SMTP not fully configured; printing message instead of emailing.")
-        print("Subject:", subject, flush=True)
-        print(body, flush=True)
-        return
+    if not email_configured(recipients):
+        warn("SMTP not fully configured; skipping email.")
+        return False
 
     msg = EmailMessage()
     msg["From"] = MAIL_FROM
@@ -175,9 +289,63 @@ def send_email(subject: str, body: str) -> None:
                 s.send_message(msg)
 
         log("Email sent successfully.")
+        return True
 
     except Exception as e:
         err(f"Email send failed ({SMTP_HOST}:{SMTP_PORT}): {e}")
+        return False
+
+
+async def _send_fluxer_async(content: str) -> None:
+    api_url = normalize_fluxer_api_url(FLUXER_API_URL_RAW)
+    log(f"Fluxer API: {api_url} channel={FLUXER_CHANNEL_ID}")
+    async with fluxerpy3.Client(token=FLUXER_TOKEN, base_url=api_url) as client:
+        me = await client.get_me()
+        log(f"Logged in to Fluxer as {me.username}")
+        await client.send_message(FLUXER_CHANNEL_ID, content)
+
+
+def send_fluxer(subject: str, body: str) -> bool:
+    """
+    Post the waitlist update to a Fluxer channel via fluxerpy3.
+    Works with the official API or a self-hosted instance (FLUXER_API_URL).
+    """
+    if not fluxer_configured():
+        warn("Fluxer not fully configured (need FLUXER_TOKEN and FLUXER_CHANNEL_ID); skipping.")
+        return False
+
+    if fluxerpy3 is None:
+        err("fluxerpy3 is not installed. Run: pip install fluxerpy3")
+        return False
+
+    content = f"**{subject}**\n\n{body}".strip()
+
+    try:
+        asyncio.run(_send_fluxer_async(content))
+        log("Fluxer message sent successfully.")
+        return True
+    except Exception as e:
+        err(f"Fluxer send failed: {e}")
+        return False
+
+
+def notify(subject: str, body: str) -> None:
+    """
+    Send the update to Fluxer and/or email, whichever is configured.
+    If nothing is sent, print the message instead.
+    """
+    sent = False
+
+    if fluxer_configured():
+        sent = send_fluxer(subject, body) or sent
+    else:
+        log("Fluxer notifications disabled (set FLUXER_TOKEN and FLUXER_CHANNEL_ID to enable).")
+
+    if email_configured():
+        sent = send_email(subject, body) or sent
+
+    if not sent:
+        warn("No notification channel succeeded; printing message instead.")
         print("Subject:", subject, flush=True)
         print(body, flush=True)
 
@@ -275,7 +443,7 @@ def run_once(target_dt_str: str, state_file: str) -> int:
                 "Time Checked:\n"
                 f"{format_time_checked_cst(now_utc)}\n"
             )
-            send_email(subject, body)
+            notify(subject, body)
             return 2
 
         current_pos = match["position"]
@@ -294,7 +462,7 @@ def run_once(target_dt_str: str, state_file: str) -> int:
         )
 
         subject = f"{MAIL_SUBJECT_PREFIX} Position: {current_pos}/{total}"
-        send_email(subject, body)
+        notify(subject, body)
 
         state["last_position"] = current_pos
         state["last_checked_utc"] = now_utc.isoformat()
@@ -312,7 +480,7 @@ def run_once(target_dt_str: str, state_file: str) -> int:
             "Time Checked:\n"
             f"{format_time_checked_cst(now_utc)}\n"
         )
-        send_email(subject, body)
+        notify(subject, body)
         return 3
 
 
@@ -323,7 +491,7 @@ def main() -> None:
     mode.add_argument("--watch", action="store_true", help="Run continuously (default).")
 
     ap.add_argument("--target", default=DEFAULT_TARGET_DATE, help="Target timestamp as shown on ARIN page.")
-    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Watch interval in seconds (default 12h).")
+    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Watch interval in seconds (default 24h).")
     ap.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Path to state file.")
 
     args = ap.parse_args()
@@ -331,7 +499,7 @@ def main() -> None:
     if args.once:
         raise SystemExit(run_once(args.target, args.state_file))
 
-    log(f"Watch mode enabled. Interval={args.interval}s (default 12h)")
+    log(f"Watch mode enabled. Interval={args.interval}s (default 24h)")
     log(f"Target={args.target}")
     log(f"State file={args.state_file}")
 
