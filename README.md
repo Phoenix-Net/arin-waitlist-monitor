@@ -131,11 +131,11 @@ python ~/arin-waitlist-monitor/arin_waitlist.py --watch
 
 ## Notification Format
 
-Posted to Fluxer (and emailed, if SMTP is configured):
+Fluxer gets a rich embed (colored sidebar, title, and inline fields). The sidebar is green if you moved up the list, gray if nothing changed, and red if you moved down.
+
+Email (if SMTP is configured) stays plain text:
 
 ```
-**[ARIN Waitlist] Position: XXX/XXX**
-
 Your current ARIN IPv4 waiting list position is:
 XXX/XXX.
 

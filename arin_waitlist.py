@@ -287,9 +287,114 @@ def send_email(subject: str, body: str) -> bool:
         return False
 
 
-def send_fluxer(subject: str, body: str) -> bool:
+# Embed sidebar colors (Discord/Fluxer integer RGB)
+COLOR_INFO = 0x3498DB
+COLOR_OK = 0x2ECC71
+COLOR_WARN = 0xF1C40F
+COLOR_BAD = 0xE74C3C
+COLOR_NEUTRAL = 0x95A5A6
+
+
+def _iso_timestamp(now_utc: datetime) -> str:
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    return now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _position_change(current_pos: int, last_pos: int | None) -> tuple[str, int]:
     """
-    POST the waitlist update to a Fluxer incoming webhook.
+    Lower waitlist number is better. Returns (label, embed color).
+    """
+    if last_pos is None:
+        return "First check", COLOR_INFO
+    if current_pos < last_pos:
+        return f"▲ {last_pos - current_pos}", COLOR_OK
+    if current_pos > last_pos:
+        return f"▼ {current_pos - last_pos}", COLOR_BAD
+    return "No change", COLOR_NEUTRAL
+
+
+def build_fluxer_embed(
+    *,
+    title: str,
+    description: str,
+    color: int,
+    now_utc: datetime,
+    time_checked: str,
+    fields: list[dict],
+) -> dict:
+    return {
+        "type": "rich",
+        "title": title,
+        "url": WAITLIST_URL,
+        "description": description,
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"Checked {time_checked}"},
+        "timestamp": _iso_timestamp(now_utc),
+    }
+
+
+def embed_found(
+    *,
+    current_pos: int,
+    total: int,
+    last_pos: int | None,
+    joined: str,
+    maxp: str,
+    minp: str,
+    now_utc: datetime,
+    time_checked: str,
+) -> dict:
+    change, color = _position_change(current_pos, last_pos)
+    last_pos_str = str(last_pos) if last_pos is not None else "—"
+    return build_fluxer_embed(
+        title=f"ARIN IPv4 Waitlist — {current_pos}/{total}",
+        description="Your current ARIN IPv4 waiting list position.",
+        color=color,
+        now_utc=now_utc,
+        time_checked=time_checked,
+        fields=[
+            {"name": "Current", "value": f"**{current_pos}/{total}**", "inline": True},
+            {"name": "Last", "value": f"{last_pos_str}/{total}", "inline": True},
+            {"name": "Change", "value": change, "inline": True},
+            {"name": "Max Prefix", "value": maxp, "inline": True},
+            {"name": "Min Prefix", "value": minp, "inline": True},
+            {"name": "Joined", "value": joined, "inline": True},
+        ],
+    )
+
+
+def embed_not_found(*, target: str, total: int, now_utc: datetime, time_checked: str) -> dict:
+    return build_fluxer_embed(
+        title="ARIN IPv4 Waitlist — Not Found",
+        description="Could not find your entry in the ARIN waiting list table.",
+        color=COLOR_WARN,
+        now_utc=now_utc,
+        time_checked=time_checked,
+        fields=[
+            {"name": "Target timestamp", "value": target, "inline": False},
+            {"name": "Rows parsed", "value": str(total), "inline": True},
+        ],
+    )
+
+
+def embed_error(*, error: str, now_utc: datetime, time_checked: str) -> dict:
+    return build_fluxer_embed(
+        title="ARIN IPv4 Waitlist — Error",
+        description="The waitlist check failed.",
+        color=COLOR_BAD,
+        now_utc=now_utc,
+        time_checked=time_checked,
+        fields=[
+            {"name": "Error", "value": f"```{error[:1000]}```", "inline": False},
+        ],
+    )
+
+
+def send_fluxer(subject: str, body: str, embed: dict | None = None) -> bool:
+    """
+    POST the waitlist update to a Fluxer incoming webhook as a rich embed.
     Official or self-hosted — the webhook URL already includes the host.
     """
     if not fluxer_configured():
@@ -301,7 +406,19 @@ def send_fluxer(subject: str, body: str) -> bool:
         err(f"FLUXER_WEBHOOK_URL is not a valid http(s) URL: {FLUXER_WEBHOOK_URL!r}")
         return False
 
-    payload: dict = {"content": f"**{subject}**\n\n{body}".strip()}
+    payload: dict = {
+        "embeds": [embed]
+        if embed is not None
+        else [
+            {
+                "type": "rich",
+                "title": subject,
+                "description": body,
+                "color": COLOR_INFO,
+                "url": WAITLIST_URL,
+            }
+        ],
+    }
     if FLUXER_WEBHOOK_USERNAME:
         payload["username"] = FLUXER_WEBHOOK_USERNAME
 
@@ -334,7 +451,7 @@ def send_fluxer(subject: str, body: str) -> bool:
         return False
 
 
-def notify(subject: str, body: str) -> None:
+def notify(subject: str, body: str, embed: dict | None = None) -> None:
     """
     Send the update to Fluxer and/or email, whichever is configured.
     If nothing is sent, print the message instead.
@@ -342,7 +459,7 @@ def notify(subject: str, body: str) -> None:
     sent = False
 
     if fluxer_configured():
-        sent = send_fluxer(subject, body) or sent
+        sent = send_fluxer(subject, body, embed=embed) or sent
     else:
         log("Fluxer notifications disabled (set FLUXER_WEBHOOK_URL to enable).")
 
@@ -446,25 +563,36 @@ def run_once(target_dt_str: str, state_file: str) -> int:
         if not match:
             warn("Entry not found in table")
             subject = f"{MAIL_SUBJECT_PREFIX} NOT FOUND"
+            time_checked = format_time_checked_cst(now_utc)
             body = (
                 "Could not find your entry in the ARIN waiting list table.\n\n"
                 f"Target timestamp:\n{target_dt_str}\n\n"
                 f"Rows parsed:\n{total}\n\n"
                 "Time Checked:\n"
-                f"{format_time_checked_cst(now_utc)}\n"
+                f"{time_checked}\n"
             )
-            notify(subject, body)
+            notify(
+                subject,
+                body,
+                embed=embed_not_found(
+                    target=target_dt_str,
+                    total=total,
+                    now_utc=now_utc,
+                    time_checked=time_checked,
+                ),
+            )
             return 2
 
         current_pos = match["position"]
         last_pos = state.get("last_position")
+        last_pos = int(last_pos) if last_pos is not None else None
         log(f"Match found! Current position = {current_pos}/{total}")
 
         time_checked = format_time_checked_cst(now_utc)
         body = build_body(
             current_pos=current_pos,
             total=total,
-            last_pos=int(last_pos) if last_pos is not None else None,
+            last_pos=last_pos,
             joined=target_dt_str,
             maxp=match["max_prefix"],
             minp=match["min_prefix"],
@@ -472,7 +600,20 @@ def run_once(target_dt_str: str, state_file: str) -> int:
         )
 
         subject = f"{MAIL_SUBJECT_PREFIX} Position: {current_pos}/{total}"
-        notify(subject, body)
+        notify(
+            subject,
+            body,
+            embed=embed_found(
+                current_pos=current_pos,
+                total=total,
+                last_pos=last_pos,
+                joined=target_dt_str,
+                maxp=match["max_prefix"],
+                minp=match["min_prefix"],
+                now_utc=now_utc,
+                time_checked=time_checked,
+            ),
+        )
 
         state["last_position"] = current_pos
         state["last_checked_utc"] = now_utc.isoformat()
@@ -484,13 +625,18 @@ def run_once(target_dt_str: str, state_file: str) -> int:
     except Exception as e:
         err(f"Run failed: {e}")
         subject = f"{MAIL_SUBJECT_PREFIX} ERROR"
+        time_checked = format_time_checked_cst(now_utc)
         body = (
             "Error while checking ARIN waiting list:\n"
             f"{e}\n\n"
             "Time Checked:\n"
-            f"{format_time_checked_cst(now_utc)}\n"
+            f"{time_checked}\n"
         )
-        notify(subject, body)
+        notify(
+            subject,
+            body,
+            embed=embed_error(error=str(e), now_utc=now_utc, time_checked=time_checked),
+        )
         return 3
 
 
